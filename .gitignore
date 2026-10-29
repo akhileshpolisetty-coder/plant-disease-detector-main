@@ -1,0 +1,35 @@
+# ── Dataset (too large for GitHub) ─────────────────────────────────────────
+data/raw/
+data/processed/
+data
+
+# ── Model weights (binary, large) ──────────────────────────────────────────
+models/*.pth
+!models/resnet_transfer_best.pth
+
+# ── Keep results (plots & history CSVs) ────────────────────────────────────
+!models/*.png
+!models/*.csv
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+env/
+venv/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
