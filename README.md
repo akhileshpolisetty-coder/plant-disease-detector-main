@@ -95,6 +95,8 @@ python -m streamlit run app.py
 ```
 
 - Displays candidate scores and marks low-scoring predictions as uncertain
+- Uses an ImageNet-based plant-image check as a best-effort filter. It accepted 98.6% of the processed validation images at its current threshold, but this is not a guarantee for other plant or non-plant photos
+- Detects very blurry photos and asks for a retake; mildly soft photos get conservative sharpening, which cannot restore missing detail
 - Shows photo-quality tips and a clear screening-only warning
 - A model score is not a calibrated probability. The dataset uses controlled images; validate results on field photos before relying on them.
 

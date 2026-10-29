@@ -10,7 +10,8 @@ import streamlit as st
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image, ImageOps
+from torchvision.models import ResNet18_Weights, resnet18
+from PIL import Image, ImageFilter, ImageOps, ImageStat
 
 # ── path bootstrap ────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -22,6 +23,17 @@ from model_transfer import get_resnet_model  # type: ignore[import]
 MODELS_DIR      = BASE_DIR / "models"
 PROCESSED_TRAIN = BASE_DIR / "data" / "processed" / "train"
 MIN_MODEL_SCORE = 0.65
+MIN_PLANT_SCORE = 0.002
+MIN_IMAGE_DETAIL_STDDEV = 8.0
+MIN_SHARPNESS_SCORE = 400.0
+ENHANCE_SHARPNESS_SCORE = 1000.0
+PLANT_IMAGENET_LABELS = {
+    "head cabbage", "broccoli", "cauliflower", "zucchini", "spaghetti squash",
+    "acorn squash", "butternut squash", "cucumber", "artichoke", "bell pepper",
+    "Granny Smith", "strawberry", "orange", "lemon", "fig", "pineapple",
+    "banana", "jackfruit", "custard apple", "pomegranate", "daisy", "corn",
+    "acorn", "buckeye",
+}
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -286,6 +298,50 @@ def load_model(num_classes: int):
     return None, error, None
 
 
+@st.cache_resource
+def load_plant_image_validator():
+    weights = ResNet18_Weights.DEFAULT
+    categories = weights.meta["categories"]
+    plant_indices = [
+        index for index, category in enumerate(categories)
+        if category in PLANT_IMAGENET_LABELS
+    ]
+    if not plant_indices:
+        raise RuntimeError("No plant categories are available in the image validator.")
+
+    validator = resnet18(weights=weights)
+    validator.eval()
+    return validator, weights.transforms(), plant_indices
+
+
+def is_plant_image(image: Image.Image, validator, preprocess, plant_indices) -> tuple[bool, float]:
+    rgb_image = image.convert("RGB")
+    if max(ImageStat.Stat(rgb_image).stddev) < MIN_IMAGE_DETAIL_STDDEV:
+        return False, 0.0
+
+    tensor = preprocess(rgb_image).unsqueeze(0)
+    with torch.inference_mode():
+        scores = F.softmax(validator(tensor), dim=1)[0]
+    plant_score = scores[plant_indices].sum().item()
+    return plant_score >= MIN_PLANT_SCORE, plant_score
+
+
+def prepare_leaf_image(image: Image.Image) -> tuple[Image.Image, float, bool]:
+    grayscale = image.convert("L").resize((256, 256), Image.Resampling.BILINEAR)
+    sharpness_score = ImageStat.Stat(
+        grayscale.filter(ImageFilter.FIND_EDGES)
+    ).var[0]
+
+    if sharpness_score < MIN_SHARPNESS_SCORE:
+        return image, sharpness_score, False
+    if sharpness_score < ENHANCE_SHARPNESS_SCORE:
+        sharpened = image.filter(
+            ImageFilter.UnsharpMask(radius=1.2, percent=125, threshold=3)
+        )
+        return sharpened, sharpness_score, True
+    return image, sharpness_score, False
+
+
 INFER_TF = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -397,7 +453,8 @@ with left_col:
     st.markdown('<p class="section-label">Upload leaf image</p>', unsafe_allow_html=True)
     st.caption(
         "For a better result, photograph one whole leaf in focus, in natural light, "
-        "with minimal background."
+        "with minimal background. The plant-image check is best-effort, so unusual "
+        "plant photos may still be rejected."
     )
     uploaded = st.file_uploader(
         "leaf_upload",
@@ -417,8 +474,17 @@ with right_col:
     img_sub_col, info_sub_col = st.columns([1, 1.1], gap="medium")
     
     image = None
+    sharpness_score = None
+    was_sharpened = False
+    upload_error = None
     if uploaded:
-        image = Image.open(uploaded).convert("RGB")
+        try:
+            with Image.open(uploaded) as opened_image:
+                opened_image.load()
+                original_image = ImageOps.exif_transpose(opened_image).convert("RGB")
+            image, sharpness_score, was_sharpened = prepare_leaf_image(original_image)
+        except (Image.UnidentifiedImageError, OSError, ValueError) as exc:
+            upload_error = f"Could not read this image: {exc}"
         
     with img_sub_col:
         if image is not None:
@@ -426,7 +492,10 @@ with right_col:
             st.markdown('<div class="image-frame">', unsafe_allow_html=True)
             st.image(image, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
-            st.caption("Original photo")
+            st.caption(
+                "Preview with mild sharpening applied."
+                if was_sharpened else "Original photo"
+            )
         else:
             st.markdown("""
             <div class="placeholder" style="min-height: 250px;">
@@ -436,61 +505,100 @@ with right_col:
             """, unsafe_allow_html=True)
             
     with info_sub_col:
-        if image is not None and classes and model is not None:
-            with st.spinner("Analysing leaf symptoms…"):
-                top_preds, attention_image = predict_with_attention(
-                    model, image, top_k=5
+        if upload_error:
+            st.error(upload_error)
+        elif image is not None and classes and model is not None:
+            if sharpness_score is not None and sharpness_score < MIN_SHARPNESS_SCORE:
+                st.error(
+                    "This photo is too blurry to analyze reliably, so no disease "
+                    "prediction was made. Retake it with the camera focused on the "
+                    "leaf, hold the camera steady, and use good lighting."
                 )
-
-            top_idx, top_conf = top_preds[0]
-            plant, disease = split_label(classes[top_idx])
-            is_healthy = disease.casefold() == "healthy"
-            st.markdown("**Approximate region the model focused on**")
-            st.image(attention_image, use_container_width=True)
-            st.caption(
-                "Warm colors show areas that influenced this class prediction. "
-                "This is a coarse attention map, not a measured disease boundary."
-            )
-            if top_conf < MIN_MODEL_SCORE:
-                st.warning(
-                    f"Uncertain result. The top candidate is {plant} — {disease}. "
-                    "Try a clear, close-up photo of one leaf in natural light "
-                    "and compare the alternatives below."
-                )
-            elif is_healthy:
-                st.success("Leaf status: likely healthy")
-                st.caption(f"Top match: {plant} — {disease}")
             else:
-                st.warning("Leaf status: possible issue detected")
-                st.markdown(f"**Likely issue:** {disease}  \n**Plant:** {plant}")
-            st.caption(
-                f"Model score: {top_conf * 100:.1f}% · This is an image-classifier "
-                "score, not a calibrated probability or a confirmed diagnosis."
-            )
+                validation_error = None
+                try:
+                    plant_validator, plant_preprocess, plant_indices = load_plant_image_validator()
+                    is_plant, plant_score = is_plant_image(
+                        image, plant_validator, plant_preprocess, plant_indices
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    validation_error = exc
+                    plant_score = 0.0
 
-            if classes[top_idx] == "Tomato___Bacterial_spot":
-                st.info(
-                    "**Possible tomato bacterial spot.** Look for small, dark, "
-                    "water-soaked spots that may develop yellow halos. Similar "
-                    "symptoms can have other causes, so this photo cannot confirm "
-                    "the pathogen. Avoid overhead watering, clean tools between "
-                    "plants, and consult a local plant-health extension service "
-                    "before treating."
-                )
+                if validation_error is not None:
+                    st.error(f"Could not verify that this is a plant image: {validation_error}")
+                elif not is_plant:
+                    st.error(
+                        "This image was not recognized as a plant image, so no disease "
+                        "prediction was made. Upload a clear photo of a plant or leaf. "
+                        f"(Plant-image score: {plant_score:.1%})"
+                    )
+                else:
+                    if was_sharpened:
+                        st.warning(
+                            "This photo looked slightly soft, so mild sharpening was "
+                            "applied. Sharpening cannot restore missing detail; retake "
+                            "the photo if possible."
+                        )
+                    with st.spinner("Analysing leaf symptoms…"):
+                        top_preds, attention_image = predict_with_attention(
+                            model, image, top_k=5
+                        )
 
-            for idx, conf in top_preds:
-                p, d = split_label(classes[idx])
-                label = f"{p} · {d}"
-                pct   = conf * 100
-                st.markdown(f"""
-              <div class="bar-row">
-                <div class="bar-label" title="{label}">{label}</div>
-                <div class="bar-track">
-                  <div class="bar-fill" style="width:{pct:.1f}%"></div>
-                </div>
-                <div class="bar-pct">{pct:.0f}%</div>
-              </div>
-                """, unsafe_allow_html=True)
+                    top_idx, top_conf = top_preds[0]
+                    plant, disease = split_label(classes[top_idx])
+                    is_healthy = disease.casefold() == "healthy"
+                    st.markdown("**Approximate region the model focused on**")
+                    st.image(attention_image, use_container_width=True)
+                    st.caption(
+                        "Warm colors show areas that influenced this class prediction. "
+                        "This is a coarse attention map, not a measured disease boundary."
+                    )
+                    if top_conf < MIN_MODEL_SCORE:
+                        st.warning(
+                            f"Uncertain result. The top candidate is {plant} — {disease}. "
+                            "Try a clear, close-up photo of one leaf in natural light "
+                            "and compare the alternatives below."
+                        )
+                    elif is_healthy:
+                        st.success("Leaf status: likely healthy")
+                        st.caption(f"Top match: {plant} — {disease}")
+                    else:
+                        st.warning("Leaf status: possible issue detected")
+                        st.markdown(f"**Likely issue:** {disease}  \n**Plant:** {plant}")
+                    st.caption(
+                        f"Model score: {top_conf * 100:.1f}% · This is an image-classifier "
+                        "score, not a calibrated probability or a confirmed diagnosis."
+                    )
+
+                    if (
+                        top_conf >= MIN_MODEL_SCORE
+                        and classes[top_idx] == "Tomato___Bacterial_spot"
+                    ):
+                        st.info(
+                            "**Possible tomato bacterial spot.** Look for small, dark, "
+                            "water-soaked spots that may develop yellow halos. Similar "
+                            "symptoms can have other causes, so this photo cannot confirm "
+                            "the pathogen. Avoid overhead watering, clean tools between "
+                            "plants, and consult a local plant-health extension service "
+                            "before treating."
+                        )
+
+                    for idx, conf in top_preds:
+                        p, d = split_label(classes[idx])
+                        label = f"{p} · {d}"
+                        pct   = conf * 100
+                        st.markdown(f"""
+                      <div class="bar-row">
+                        <div class="bar-label" title="{label}">{label}</div>
+                        <div class="bar-track">
+                          <div class="bar-fill" style="width:{pct:.1f}%"></div>
+                        </div>
+                        <div class="bar-pct">{pct:.0f}%</div>
+                      </div>
+                        """, unsafe_allow_html=True)
+        elif image is not None and not classes:
+            st.warning("Cannot check this image until the plant classes are configured.")
                 
         elif err:
             st.markdown(f"""
